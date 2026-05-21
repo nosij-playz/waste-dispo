@@ -18,3 +18,8 @@ htmlcov/
 *.log
 Thumbs.db
 .DS_Store
+
+# App runtime artifacts
+session_state.json
+interface/dashboard.html
+display/*.png
