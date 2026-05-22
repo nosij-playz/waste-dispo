@@ -1,5 +1,6 @@
 .env
 venv/
+jvenv/
 
 # Python
 __pycache__/
