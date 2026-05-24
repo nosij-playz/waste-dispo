@@ -8,7 +8,7 @@ if __name__ == "__main__":
 
     print(f"🚀 Starting {system_name} Command Center...")
 
-    upload_image = None
+    upload_image = ["disposable-garbage-bags-613.jpg","3480.webp"]
     location = default_location
     master = WasteDispoMaster(default_location=location)
 

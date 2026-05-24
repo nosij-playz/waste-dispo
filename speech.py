@@ -39,6 +39,8 @@ def main():
             user_in = listen()
 
             if not user_in:
+                import time
+                time.sleep(0.5)  # Prevent rapid retries
                 continue
 
             print(f"\nYou (Voice): {user_in}")

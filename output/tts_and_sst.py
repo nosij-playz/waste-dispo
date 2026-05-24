@@ -47,24 +47,39 @@ def listen():
     """Listens to microphone and returns recognized text"""
     recognizer = sr.Recognizer()
     
-    with sr.Microphone() as source:
-        print("\nListening... (Speak now)")
-        # Adjust for background noise
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-        try:
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
-        except sr.WaitTimeoutError:
-            return None
+    max_retries = 3
+    for attempt in range(max_retries):
+        if attempt > 0:
+            print(f"Retrying... ({attempt + 1}/{max_retries})")
 
-    try:
-        print("Recognizing...")
-        text = recognizer.recognize_google(audio)
-        print(f"You: {text}")
-        return text
-    except sr.UnknownValueError:
-        print("AI: I didn't quite catch that.")
-        return None
-    except sr.RequestError:
-        print("AI: System Error: Could not connect to the speech service.")
-        return None
+        with sr.Microphone() as source:
+            print("\nListening... (Speak now)")
+            recognizer.adjust_for_ambient_noise(source, duration=3)
+            try:
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
+            except sr.WaitTimeoutError:
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(0.5)
+                continue
+
+        try:
+            text = recognizer.recognize_google(audio)
+            print(f"You: {text}")
+            return text
+        except sr.UnknownValueError:
+            print("AI: I didn't quite catch that.")
+            if attempt < max_retries - 1:
+                import time
+                time.sleep(0.5)
+            continue
+        except sr.RequestError:
+            print("AI: System Error: Could not connect to the speech service.")
+            if attempt < max_retries - 1:
+                import time
+                time.sleep(0.5)
+            continue
+
+    print("AI: No input detected after retries.")
+    return None
 

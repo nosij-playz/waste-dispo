@@ -14,6 +14,7 @@ from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 
 # Importing your agents
 from Agents.env_live import EnvironmentalDataFetcher
+from Agents.summarizer import TechnicalTextSummarizer
 from image.explain import Vision 
 from Agents.Plotter import AIPlotterApp
 from Agents.research import ResearchAnalyzer
@@ -116,6 +117,7 @@ class WasteDispoMaster:
             "vision_agent": {"module": VisionAgentWrapper(), "description": "Analyzes images of waste.", "type": "TEXT"},
             "plotter_agent": {"module": PlotterAgentWrapper(), "description": "Creates high-end data visualizations.", "type": "FILE"},
             "search_agent": {"module": ResearchAgentWrapper(), "description": "Deep internet research on waste/chemicals.", "type": "REPORT"},
+            "summarizer_agent": {"module": SummarizerAgentWrapper(), "description": "Condenses long agent logs into concise executive summaries.", "type": "TEXT"},
             "classifier_agent": {"module": ClassifierAgentWrapper(), "description": "Classifies waste using local YOLO model.", "type": "IMAGE"},
             "dashboard_agent": {"module": DashboardAgentWrapper(), "description": "Generates a comprehensive Intelligence Command Center.", "type": "FILE"}
         }
@@ -285,7 +287,7 @@ class WasteDispoMaster:
         if not text:
             return False
         t = text.lower()
-        return any(k in t for k in ["explain image", "analyze image", "analyse image", "image analysis", "demo image", "3480.webp", "3480"]) 
+        return any(k in t for k in ["explain image", "analyze image", "analyse image", "image analysis", "demo image"]) 
 
     def _wants_classification(self, text: str) -> bool:
         if not text:
@@ -427,8 +429,6 @@ class WasteDispoMaster:
         if isinstance(search_res, dict) and search_res.get("success"):
             insights.append("Research signals below include the latest web sources; prioritize local policy/infrastructure changes for actionability.")
 
-        if not insights:
-            insights.append("Run a full data report to populate live KPIs, visuals, and insights.")
         return insights
 
     def _cleanup_previous_outputs(self):
@@ -799,7 +799,41 @@ class WasteDispoMaster:
         if plot_analysis:
             lines.append(plot_analysis)
 
-        return "\n".join(lines)
+        report_text = "\n".join(lines)
+        report_text = self._remove_tags_emojis_and_special_chars(report_text)
+        report_text = self._limit_chat_paragraphs(report_text, max_paragraphs=3)
+        try:
+            summarizer = self.agents.get("summarizer_agent", {}).get("module")
+            if summarizer:
+                summary_result = summarizer.run({"text": report_text})
+                if isinstance(summary_result, dict):
+                    summarized = summary_result.get("summary") or summary_result.get("text") or summary_result.get("output")
+                    if summarized:
+                        summarized, tables = self._parse_summary_output(summarized)
+                        self._stage_summary_tables(tables)
+                        if tables and self.agents["dashboard_agent"]["module"]:
+                            self.context["knowledge_base"]["master_insights"] = self._build_master_insights(self.context["knowledge_base"])
+                            dash_res = self.agents["dashboard_agent"]["module"].run({"knowledge_base": self.context["knowledge_base"]})
+                            self.context["knowledge_base"]["dashboard_agent"] = dash_res
+                            if isinstance(dash_res, dict) and dash_res.get("file_path") and dash_res.get("file_path") not in self.context["created_files"]:
+                                self.context["created_files"].append(dash_res.get("file_path"))
+                            self.session.save(self.context)
+                        return summarized
+                elif isinstance(summary_result, str) and summary_result.strip():
+                    summarized, tables = self._parse_summary_output(summary_result)
+                    self._stage_summary_tables(tables)
+                    if tables and self.agents["dashboard_agent"]["module"]:
+                        self.context["knowledge_base"]["master_insights"] = self._build_master_insights(self.context["knowledge_base"])
+                        dash_res = self.agents["dashboard_agent"]["module"].run({"knowledge_base": self.context["knowledge_base"]})
+                        self.context["knowledge_base"]["dashboard_agent"] = dash_res
+                        if isinstance(dash_res, dict) and dash_res.get("file_path") and dash_res.get("file_path") not in self.context["created_files"]:
+                            self.context["created_files"].append(dash_res.get("file_path"))
+                        self.session.save(self.context)
+                    return summarized
+        except Exception as error:
+            print(f"Summarizer agent failed in full report pipeline: {error}")
+
+        return report_text
 
     def _should_run_plotter(self, params: Dict, user_text: str) -> bool:
         # For full reports, allow plotting even if the user didn't provide explicit data.
@@ -983,6 +1017,14 @@ class WasteDispoMaster:
         plot_analysis = self._format_plot_explanations(plot_explanations)
         if plot_analysis:
             response = f"{response}\n\n{plot_analysis}"
+
+        if self.context.get("knowledge_base", {}).get("summary_tables") and self.agents["dashboard_agent"]["module"]:
+            self.context["knowledge_base"]["master_insights"] = self._build_master_insights(self.context["knowledge_base"])
+            dash_res = self.agents["dashboard_agent"]["module"].run({"knowledge_base": self.context["knowledge_base"]})
+            self.context["knowledge_base"]["dashboard_agent"] = dash_res
+            if isinstance(dash_res, dict) and dash_res.get("file_path") and dash_res.get("file_path") not in self.context["created_files"]:
+                self.context["created_files"].append(dash_res.get("file_path"))
+            self.session.save(self.context)
         return response
 
     def process_input(self, user_text):
@@ -1022,13 +1064,16 @@ class WasteDispoMaster:
 
                 if detections:
                     lines = [f"Classification complete for {os.path.basename(image_path)}:"]
-                    for item in detections[:5]:
+                    for item in detections[:8]:
                         label = item.get("label") or "unknown"
                         confidence = item.get("confidence")
                         lines.append(f"- {label} ({confidence:.2f})" if isinstance(confidence, (int, float)) else f"- {label}")
-                    return "\n".join(lines)
+                    raw = "\n".join(lines)
+                    # Let the summarizer produce a user-friendly message
+                    return self._summarize_for_user(raw, context="classification")
 
-                return f"Classification complete for {os.path.basename(image_path)}, but no detections were returned."
+                raw = f"Classification complete for {os.path.basename(image_path)}, but no detections were returned."
+                return self._summarize_for_user(raw, context="classification")
 
             return classification.get("error") if isinstance(classification, dict) and classification.get("error") else "Classification failed."
 
@@ -1069,7 +1114,10 @@ class WasteDispoMaster:
             if isinstance(dash_res, dict):
                 self.context["knowledge_base"]["dashboard_agent"] = dash_res
             self.session.save(self.context)
-            return f"Image analyzed: {image_path}"
+
+            # Summarize the image explanation for user-friendly chat output
+            raw = f"Image analysis for {os.path.basename(image_path)}: {explanation}"
+            return self._summarize_for_user(raw, context="image_analysis")
 
         # Implicit consent: user confirms a previously suggested action.
         if self._is_affirmative_text(user_text) and self.context.get("last_suggested_actions"):
@@ -1158,22 +1206,44 @@ class WasteDispoMaster:
         total_agents = len(logs) if logs else 1
         data_completeness = successful_agents / total_agents if total_agents > 0 else 0
         
-        # Reduced prompt for 4K token sweet spot
-        prompt = (
-            f"The user asked: '{original_query}'\nResults: {data_summary}\n\n"
-            f"Provide a concise, chat-friendly response (200-400 words max). "
-            f"Focus on: 1) Key findings, 2) Risk assessment, 3) Top 3 actions. "
-            f"Be direct and actionable. Avoid verbose explanations."
-        )
-        response = ollama.chat(
-            model=self.model_name, 
-            messages=[{'role': 'user', 'content': prompt}],
-            stream=False
-        )
-        response_text = response['message']['content']
-        
-        # Clean markdown and special characters
-        response_text = self._clean_response_text(response_text)
+        summary_source = [
+            f"User request: {original_query}",
+            "Execution log:",
+            data_summary,
+        ]
+        summary_input = "\n\n".join(summary_source)
+
+        response_text = None
+        try:
+            summarizer = self.agents.get("summarizer_agent", {}).get("module")
+            if summarizer:
+                summary_result = summarizer.run({"text": summary_input})
+                if isinstance(summary_result, dict):
+                    response_text = summary_result.get("summary") or summary_result.get("text") or summary_result.get("output")
+                elif isinstance(summary_result, str):
+                    response_text = summary_result
+        except Exception as error:
+            print(f"Summarizer agent failed: {error}")
+
+        if not response_text:
+            prompt = (
+                f"The user asked: '{original_query}'\nResults: {data_summary}\n\n"
+                f"Provide a concise, chat-friendly response (200-400 words max). "
+                f"Focus on: 1) Key findings, 2) Risk assessment, 3) Top 3 actions. "
+                f"Be direct and actionable. Avoid verbose explanations."
+            )
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[{'role': 'user', 'content': prompt}],
+                stream=False
+            )
+            response_text = response['message']['content']
+
+        response_text, tables = self._parse_summary_output(response_text)
+        self._stage_summary_tables(tables)
+
+        # Keep the chat answer compact and paragraph-based.
+        response_text = self._limit_chat_paragraphs(response_text, max_paragraphs=3)
         
         # Grade the response quality
         quality = self._grade_response_quality(response_text, data_completeness)
@@ -1183,6 +1253,28 @@ class WasteDispoMaster:
             response_text += f"\n[Data: {quality['completeness']*100:.0f}% | Grade: {quality['grade']}]"
         
         return response_text
+
+    def _summarize_for_user(self, raw_text: str, context: Optional[str] = None) -> str:
+        """Use the summarizer agent to make raw agent outputs user-friendly.
+
+        Falls back to returning the original text on error.
+        """
+        if not raw_text:
+            return ""
+        try:
+            summarizer = self.agents.get("summarizer_agent", {}).get("module")
+            if summarizer:
+                payload = {"text": raw_text}
+                if context:
+                    payload["context"] = context
+                res = summarizer.run(payload)
+                if isinstance(res, dict):
+                    return res.get("summary") or res.get("text") or res.get("output") or raw_text
+                if isinstance(res, str):
+                    return res
+        except Exception:
+            pass
+        return raw_text
     
     def _clean_response_text(self, text: str) -> str:
         """Remove markdown and special formatting from response."""
@@ -1214,6 +1306,87 @@ class WasteDispoMaster:
         
         return text.strip()
 
+    def _remove_tags_emojis_and_special_chars(self, text: str) -> str:
+        if not text:
+            return ""
+
+        text = re.sub(r'(?<!\w)#\w+', '', text)
+        text = re.sub(r'[\U0001F300-\U0001FAFF\U00002600-\U000026FF\U00002700-\U000027BF]', '', text)
+        text = re.sub(r"[^\w\s.,;:!?()\-/%&'\"\n]", ' ', text)
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\n\s*\n+', '\n\n', text)
+        return text.strip()
+
+    def _extract_markdown_tables(self, text: str):
+        if not text:
+            return [], text
+
+        lines = text.splitlines()
+        tables = []
+        kept_lines = []
+        index = 0
+
+        def looks_like_separator(candidate: str) -> bool:
+            return bool(re.match(r'^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$', candidate))
+
+        while index < len(lines):
+            current = lines[index]
+            next_line = lines[index + 1] if index + 1 < len(lines) else ""
+
+            if "|" in current and looks_like_separator(next_line):
+                headers = [cell.strip() for cell in current.strip().strip("|").split("|")]
+                rows = []
+                index += 2
+
+                while index < len(lines):
+                    row_line = lines[index]
+                    if "|" not in row_line or not row_line.strip():
+                        break
+                    row = [cell.strip() for cell in row_line.strip().strip("|").split("|")]
+                    if any(cell for cell in row):
+                        rows.append(row)
+                    index += 1
+
+                if headers and rows:
+                    tables.append({"headers": headers, "rows": rows})
+                continue
+
+            kept_lines.append(current)
+            index += 1
+
+        return tables, "\n".join(kept_lines)
+
+    def _limit_chat_paragraphs(self, text: str, max_paragraphs: int = 3) -> str:
+        if not text:
+            return text
+
+        paragraphs = [part.strip() for part in re.split(r'\n{2,}', text) if part.strip()]
+        if not paragraphs:
+            return text.strip()
+
+        if len(paragraphs) > max_paragraphs:
+            sentences = [sentence.strip() for sentence in re.split(r'(?<=[.!?])\s+', ' '.join(paragraphs)) if sentence.strip()]
+            if sentences:
+                per_paragraph = max(1, (len(sentences) + max_paragraphs - 1) // max_paragraphs)
+                paragraphs = [
+                    ' '.join(sentences[start:start + per_paragraph]).strip()
+                    for start in range(0, len(sentences), per_paragraph)
+                ]
+
+        return '\n\n'.join(paragraphs[:max_paragraphs])
+
+    def _parse_summary_output(self, summary_text: str):
+        tables, text_without_tables = self._extract_markdown_tables(summary_text)
+        cleaned_text = self._clean_response_text(text_without_tables)
+        cleaned_text = self._remove_tags_emojis_and_special_chars(cleaned_text)
+        cleaned_text = self._limit_chat_paragraphs(cleaned_text, max_paragraphs=3)
+        return cleaned_text, tables
+
+    def _stage_summary_tables(self, tables):
+        kb = self.context.setdefault("knowledge_base", {})
+        kb["summary_tables"] = tables or []
+        self.session.save(self.context)
+
     def get_status_update(self):
         """Provides quick status updates while Master is working."""
         if not self.context["is_processing"]:
@@ -1241,6 +1414,21 @@ class ResearchAgentWrapper:
         from Agents.research import ResearchAnalyzer
         self.r = ResearchAnalyzer(max_results=6, model_name="gemma4:31b-cloud", include_images=True, enable_fallback_model=False)
     def run(self, p): return self.r.run_research(p.get("query", ""))
+
+class SummarizerAgentWrapper:
+    def __init__(self):
+        self.s = TechnicalTextSummarizer()
+
+    def run(self, p):
+        text = (p or {}).get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            return {"success": False, "error": "No text provided for summarization."}
+
+        try:
+            summary = self.s.summarize(text)
+            return {"success": True, "summary": summary}
+        except Exception as error:
+            return {"success": False, "error": str(error)}
 
 class ClassifierAgentWrapper:
     def __init__(self):
@@ -1327,6 +1515,8 @@ class DashboardAgentWrapper:
 
         soil = soil_moisture + soil_temp
 
+        has_env_signals = any(value is not None for value in [temp, humidity, wind, rain]) or bool(soil_moisture)
+
         def clamp_score(val):
             try:
                 return max(0, min(100, int(round(val))))
@@ -1368,13 +1558,15 @@ class DashboardAgentWrapper:
         if humidity is not None:
             overflow_score += humidity * 0.3
 
-        risk_items = [
-            ("Decomposition Risk", clamp_score(decomp_score), "Heat + humidity accelerating organic breakdown."),
-            ("Leachate Risk", clamp_score(leachate_score), "Rain/soil saturation elevating runoff risk."),
-            ("Odor Risk", clamp_score(odor_score), "Humidity and low wind trap odors."),
-            ("Fire Risk", clamp_score(fire_score), "Heat and dryness increase combustion risk."),
-            ("Overflow Risk", clamp_score(overflow_score), "Precipitation loading storage capacity."),
-        ]
+        risk_items = []
+        if has_env_signals:
+            risk_items = [
+                ("Decomposition Risk", clamp_score(decomp_score), "Heat + humidity accelerating organic breakdown."),
+                ("Leachate Risk", clamp_score(leachate_score), "Rain/soil saturation elevating runoff risk."),
+                ("Odor Risk", clamp_score(odor_score), "Humidity and low wind trap odors."),
+                ("Fire Risk", clamp_score(fire_score), "Heat and dryness increase combustion risk."),
+                ("Overflow Risk", clamp_score(overflow_score), "Precipitation loading storage capacity."),
+            ]
 
         def risk_level(score: int) -> str:
             if score >= 80:
@@ -1397,7 +1589,8 @@ class DashboardAgentWrapper:
         add_metric(hero, "Temperature", temp, "°C")
         add_metric(hero, "Humidity", humidity, "%")
         add_metric(hero, "Wind", wind, " m/s")
-        hero.append({"label": "Waste Risk", "value": overall_level})
+        if risk_items:
+            hero.append({"label": "Waste Risk", "value": overall_level})
 
         research_items = []
         search_res = kb.get("search_agent") if isinstance(kb.get("search_agent"), dict) else {}
@@ -1413,10 +1606,6 @@ class DashboardAgentWrapper:
         for ins in (kb.get("master_insights") or []):
             insights.append(ins)
 
-        for pe in (kb.get("plot_explanations") or []):
-            if isinstance(pe, dict) and pe.get("explanation"):
-                insights.append(f"Chart Insight: {pe.get('explanation')}")
-
         visuals = []
         for ia in (kb.get("image_analyses") or []):
             if isinstance(ia, dict) and (ia.get("image") or ia.get("file_path")):
@@ -1425,12 +1614,6 @@ class DashboardAgentWrapper:
                     "image": ia.get("image") or ia.get("file_path"),
                     "description": ia.get("explanation") or "",
                 })
-
-        if os.path.isdir("display"):
-            plots = [f for f in os.listdir("display") if f.endswith(".png")]
-            for plot in sorted(plots):
-                rel = f"../display/{plot}"
-                visuals.append({"title": f"Plot: {plot}", "image": rel, "description": ""})
 
         diagnostics = []
         env_meta = {k: v for k, v in env_res.items() if k != "environmental_data"}
@@ -1457,6 +1640,7 @@ class DashboardAgentWrapper:
             "insights": insights,
             "research": research_items,
             "visuals": visuals,
+            "tables": kb.get("summary_tables") or [],
             "diagnostics": diagnostics,
         }
 
